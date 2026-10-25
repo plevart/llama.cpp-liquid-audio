@@ -1,122 +1,78 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
+# Build and publish llama-server images (CUDA 12 / Intel SYCL / Vulkan)
+# to ghcr.io/plevart/llama.cpp-liquid-audio:server-<variant>-bX
+#
+# Triggered by:
+#   - pushing a tag named b<integer> (e.g. b1, b2, ... b1234), which follows the
+#     upstream llama.cpp release convention (letter "b" + positive decimal integer).
+#     The tag name becomes the image version suffix (server-<variant>-<tag>).
+#   - manual dispatch (workflow_dispatch) as a fallback; in that case the version is
+#     computed using the upstream convention: "b" + git commit count.
 
-# GitHub recommends pinning actions to a commit SHA.
-# To get a newer version, you will need to update the SHA.
-# You can also reference a tag or branch, but the action may change without warning.
-
-name: Publish Docker image
+name: Build and push server images
 
 on:
-  workflow_dispatch: # allows manual triggering
-  schedule:
-    # Rebuild daily rather than on every push because it is expensive
-    - cron: '12 4 * * *'
+  workflow_dispatch:
+  push:
+    tags:
+      - 'b[0-9]+'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Fine-grant permission
-# https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
 permissions:
+  contents: read
   packages: write
 
 jobs:
-  push_to_registry:
-    name: Push Docker image to Docker Hub
-
-    runs-on: ${{ matrix.config.runs_on }}
-    env:
-      COMMIT_SHA: ${{ github.sha }}
+  build:
+    name: server-${{ matrix.config.tag }}
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         config:
-          # Multi-stage build
-          # Note: the arm64 images are failing, which prevents the amd64 images from being built
-          # https://github.com/ggml-org/llama.cpp/issues/11888
-          #- { tag: "cpu", dockerfile: ".devops/cpu.Dockerfile", platforms: "linux/amd64,linux/arm64", full: true, light: true, server: true, free_disk_space: false }
-          - { tag: "cpu",    dockerfile: ".devops/cpu.Dockerfile",    platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: false, runs_on: "ubuntu-22.04" }
-          - { tag: "cuda cuda12", dockerfile: ".devops/cuda.Dockerfile", platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: true,  runs_on: "ubuntu-22.04", cuda_version: "12.4.0", ubuntu_version: "22.04" }
-          - { tag: "cuda13", dockerfile: ".devops/cuda-new.Dockerfile",  platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: true,  runs_on: "ubuntu-22.04", cuda_version: "13.1.0", ubuntu_version: "24.04" }
-          - { tag: "musa",   dockerfile: ".devops/musa.Dockerfile",   platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: true,  runs_on: "ubuntu-22.04" }
-          - { tag: "intel",  dockerfile: ".devops/intel.Dockerfile",  platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: true,  runs_on: "ubuntu-22.04" }
-          - { tag: "vulkan", dockerfile: ".devops/vulkan.Dockerfile", platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: false, runs_on: "ubuntu-22.04" }
-          - { tag: "s390x",  dockerfile: ".devops/s390x.Dockerfile",  platforms: "linux/s390x", full: true, light: true, server: true, free_disk_space: false, runs_on: "ubuntu-22.04-s390x" }
-          - { tag: "rocm",   dockerfile: ".devops/rocm.Dockerfile",   platforms: "linux/amd64", full: true, light: true, server: true, free_disk_space: true,  runs_on: "ubuntu-22.04" }
+          - tag: cuda12
+            dockerfile: .devops/cuda.Dockerfile
+            build_args: |
+              UBUNTU_VERSION=22.04
+              CUDA_VERSION=12.4.0
+            free_disk_space: true
+          - tag: intel
+            dockerfile: .devops/intel.Dockerfile
+            build_args: |
+              ONEAPI_VERSION=2025.2.2-0-devel-ubuntu24.04
+              GGML_SYCL_F16=OFF
+            free_disk_space: true
+          - tag: vulkan
+            dockerfile: .devops/vulkan.Dockerfile
+            build_args: |
+              UBUNTU_VERSION=26.04
+            free_disk_space: false
+
     steps:
       - name: Check out the repo
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0 # preserve git history, so we can determine the build number
-
-      - name: Set up QEMU
-        if: ${{ matrix.config.tag != 's390x' }}
-        uses: docker/setup-qemu-action@v3
-        with:
-          image: tonistiigi/binfmt:qemu-v7.0.0-28
+          fetch-depth: 0 # preserve full history, needed to compute the build number on manual dispatch
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Determine source tag name
-        id: srctag
-        uses: ./.github/actions/get-tag-name
-        env:
-          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
-
-      - name: Determine image tag name
-        id: tag
-        shell: bash
-        run: |
-          REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
-          REPO_NAME="${{ github.event.repository.name }}"
-          PREFIX="ghcr.io/${REPO_OWNER}/${REPO_NAME}:"
-
-          # list all tags possible
-          tags="${{ matrix.config.tag }}"
-          for tag in $tags; do
-              if [[ "$tag" == "cpu" ]]; then
-                  TYPE=""
-              else
-                  TYPE="-$tag"
-              fi
-              CACHETAGS="${PREFIX}buildcache${TYPE}"
-              FULLTAGS="${FULLTAGS:+$FULLTAGS,}${PREFIX}full${TYPE},${PREFIX}full${TYPE}-${{ steps.srctag.outputs.name }}"
-              LIGHTTAGS="${LIGHTTAGS:+$LIGHTTAGS,}${PREFIX}light${TYPE},${PREFIX}light${TYPE}-${{ steps.srctag.outputs.name }}"
-              SERVERTAGS="${SERVERTAGS:+$SERVERTAGS,}${PREFIX}server${TYPE},${PREFIX}server${TYPE}-${{ steps.srctag.outputs.name }}"
-          done
-          echo "cache_output_tags=$CACHETAGS" >> $GITHUB_OUTPUT
-          echo "full_output_tags=$FULLTAGS" >> $GITHUB_OUTPUT
-          echo "light_output_tags=$LIGHTTAGS" >> $GITHUB_OUTPUT
-          echo "server_output_tags=$SERVERTAGS" >> $GITHUB_OUTPUT
-          echo "cache_output_tags=$CACHETAGS"  # print out for debugging
-          echo "full_output_tags=$FULLTAGS"  # print out for debugging
-          echo "light_output_tags=$LIGHTTAGS"  # print out for debugging
-          echo "server_output_tags=$SERVERTAGS"  # print out for debugging
-        env:
-          GITHUB_REPOSITORY_OWNER: '${{ github.repository_owner }}'
-
-      - name: Free Disk Space (Ubuntu)
+      - name: Free disk space
         if: ${{ matrix.config.free_disk_space == true }}
         uses: ggml-org/free-disk-space@v1.3.1
         with:
           # this might remove tools that are actually needed,
           # if set to "true" but frees about 6 GB
           tool-cache: false
-
-          # all of these default to true, but feel free to set to
-          # "false" if necessary for your workflow
           android: true
           dotnet: true
           haskell: true
@@ -124,103 +80,46 @@ jobs:
           docker-images: true
           swap-storage: true
 
-      - name: Build and push Full Docker image (tagged + versioned)
-        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.config.full == true }}
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: ${{ matrix.config.platforms }}
-          # tag list is generated from step above
-          tags: ${{ steps.tag.outputs.full_output_tags }}
-          file: ${{ matrix.config.dockerfile }}
-          target: full
-          provenance: false
-          build-args: |
-            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
-            ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
-          # using github experimental cache
-          #cache-from: type=gha
-          #cache-to: type=gha,mode=max
-          # return to this if the experimental github cache is having issues
-          #cache-to: type=local,dest=/tmp/.buildx-cache
-          #cache-from: type=local,src=/tmp/.buildx-cache
-          # using registry cache (no storage limit)
-          cache-from: type=registry,ref=${{ steps.tag.outputs.cache_output_tags }}
-          cache-to: type=registry,ref=${{ steps.tag.outputs.cache_output_tags }},mode=max
+      - name: Determine image version (bX)
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # tag push: use the tag itself (b1, b2, ...)
+            IMG_TAG="${{ github.ref_name }}"
+          else
+            # manual dispatch: upstream llama.cpp convention = "b" + commit count
+            BUILD_NUMBER="$(git rev-list --count HEAD)"
+            IMG_TAG="b${BUILD_NUMBER}"
+          fi
+          echo "name=${IMG_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image version: ${IMG_TAG}"
 
-      - name: Build and push Light Docker image (tagged + versioned)
-        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.config.light == true }}
-        uses: docker/build-push-action@v6
+      - name: Extract metadata (labels + tags)
+        id: meta
+        uses: docker/metadata-action@v6
         with:
-          context: .
-          push: true
-          platforms: ${{ matrix.config.platforms }}
-          # tag list is generated from step above
-          tags: ${{ steps.tag.outputs.light_output_tags }}
-          file: ${{ matrix.config.dockerfile }}
-          target: light
-          provenance: false
-          build-args: |
-            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
-            ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
-          # using github experimental cache
-          #cache-from: type=gha
-          #cache-to: type=gha,mode=max
-          # return to this if the experimental github cache is having issues
-          #cache-to: type=local,dest=/tmp/.buildx-cache
-          #cache-from: type=local,src=/tmp/.buildx-cache
-          # using registry cache (no storage limit)
-          cache-from: type=registry,ref=${{ steps.tag.outputs.cache_output_tags }}
-          cache-to: type=registry,ref=${{ steps.tag.outputs.cache_output_tags }},mode=max
+          images: ghcr.io/plevart/llama.cpp-liquid-audio
+          tags: |
+            type=raw,value=server-${{ matrix.config.tag }}-${{ steps.tag.outputs.name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/plevart/llama.cpp-liquid-audio
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=llama-server (${{ matrix.config.tag }})
 
-      - name: Build and push Server Docker image (tagged + versioned)
-        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.config.server == true }}
+      - name: Build and push server image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          platforms: ${{ matrix.config.platforms }}
-          # tag list is generated from step above
-          tags: ${{ steps.tag.outputs.server_output_tags }}
           file: ${{ matrix.config.dockerfile }}
           target: server
+          push: true
+          platforms: linux/amd64
           provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
-            ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
-          # using github experimental cache
-          #cache-from: type=gha
-          #cache-to: type=gha,mode=max
-          # return to this if the experimental github cache is having issues
-          #cache-to: type=local,dest=/tmp/.buildx-cache
-          #cache-from: type=local,src=/tmp/.buildx-cache
-          # using registry cache (no storage limit)
-          cache-from: type=registry,ref=${{ steps.tag.outputs.cache_output_tags }}
-          cache-to: type=registry,ref=${{ steps.tag.outputs.cache_output_tags }},mode=max
-
-  create_tag:
-    name: Create and push git tag
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Determine source tag name
-        id: srctag
-        uses: ./.github/actions/get-tag-name
-        env:
-          BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
-
-      - name: Create and push git tag
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git tag ${{ steps.srctag.outputs.name }} || exit 0
-          git push origin ${{ steps.srctag.outputs.name }} || exit 0
+            ${{ matrix.config.build_args }}
+          # registry-based cache (no storage limit), keyed per variant
+          cache-from: type=registry,ref=ghcr.io/plevart/llama.cpp-liquid-audio:buildcache-${{ matrix.config.tag }}
+          cache-to: type=registry,ref=ghcr.io/plevart/llama.cpp-liquid-audio:buildcache-${{ matrix.config.tag }},mode=max
